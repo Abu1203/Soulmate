@@ -1,0 +1,34 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const {fixture}=require('./harness.cjs');
+const pause=()=>new Promise(r=>setTimeout(r,2));
+async function until(check){for(let i=0;i<300;i++){if(check())return;await pause();}throw Error('condition did not settle');}
+// This exercises the actual provider's persistence/request lifecycle with hook and
+// native-boundary mocks. It is not a rendered UI, simulator, or device test.
+function hookHost(){let slots=[],cursor=0,active=true,queued=false,effects=[],current,renderFn;
+ const depsEqual=(a,b)=>a&&b&&a.length===b.length&&a.every((v,i)=>Object.is(v,b[i]));
+ const schedule=()=>{if(!queued&&active){queued=true;queueMicrotask(()=>{queued=false;if(active)render();});}};
+ const react={createContext:()=>({Provider:'Provider'}),createElement:(type,props)=>({type,props}),
+  useState(initial){const i=cursor++;if(!slots[i]){const slot={value:typeof initial==='function'?initial():initial};slot.set=v=>{const next=typeof v==='function'?v(slot.value):v;if(!Object.is(slot.value,next)){slot.value=next;schedule();}};slots[i]=slot;}return [slots[i].value,slots[i].set];},
+  useRef(initial){const i=cursor++;return slots[i]||(slots[i]={current:initial});},
+  useCallback(fn,deps){const i=cursor++;if(!slots[i]||!depsEqual(slots[i].deps,deps))slots[i]={value:fn,deps};return slots[i].value;},
+  useEffect(fn,deps){const i=cursor++;if(!slots[i]||!depsEqual(slots[i].deps,deps)){const prev=slots[i];slots[i]={deps,cleanup:prev?.cleanup};effects.push(()=>{prev?.cleanup?.();slots[i].cleanup=fn();});}},
+  useContext(){return current;}};
+ function render(){cursor=0;effects=[];current=renderFn().props.value;const pending=effects;effects=[];pending.forEach(fn=>fn());}
+ return {react,start(fn){renderFn=fn;render();},get api(){return current;},close(){active=false;slots.forEach(s=>s?.cleanup?.());}};
+}
+function initial(){return {id:'a',name:'船长',isPinned:false,settings:{systemPrompt:'航海家',background:'海边',temperature:.7,topP:.9,memoryRecall:{enabled:true,interval:1}},messages:[],createdAt:1,updatedAt:1,memories:[]};}
+async function setup(summaryHandler){const host=hookHost();let summaries=0,chatCalls=0;let f;
+ f=fixture({react:host.react,'react-native':{AppState:{addEventListener:()=>({remove(){}})}},fetch:async(_url,init)=>{const body=JSON.parse(init.body);if(body.response_format){summaries++;return summaryHandler?summaryHandler({f,body}):new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({operations:[{action:'add',content:'用户喜欢喝无糖热咖啡',kind:'fact',factKey:'user.coffee'}]})}}]}));}chatCalls++;return new Response('data:'+JSON.stringify({choices:[{delta:{content:'记住啦，下次试试无糖咖啡。'}}]})+'\n\ndata:[DONE]\n\n');}});
+ f.kv.set('@agentsoul_conversations',JSON.stringify([initial()]));f.kv.set('@agentsoul_active','a');
+ host.start(()=>f.load('src/contexts/AgentSoulContext.tsx').AgentSoulProvider({children:null}));await until(()=>host.api.conversations.length===1&&host.api.hasApiKey);
+ return {host,f,get summaries(){return summaries;},get chatCalls(){return chatCalls;}};
+}
+test('private chat and summary commit retain the exact saved memory ID and cursor after restart',async()=>{const h=await setup();try{await h.host.api.sendMessage('我喜欢无糖热咖啡');await until(()=>h.host.api.conversations[0].memories.length===1);const c=h.host.api.conversations[0];assert.equal(c.messages.length,2);assert.equal(c.memoryState.cursors.a.throughIds[0],c.messages[0].id);const stored=JSON.parse(JSON.parse(h.f.kv.get('@soulmate_conversations_commit_v1')).payload)[0];assert.equal(stored.memories[0].id,c.memories[0].id);assert.deepEqual(stored.memoryState,JSON.parse(JSON.stringify(c.memoryState)));const fresh=fixture({"@react-native-async-storage/async-storage":h.f.as,"expo-file-system/legacy":h.f.fm});const restarted=await fresh.load("src/services/agentsoulStorage.ts").loadConversations();assert.equal(restarted.conversations[0].memories[0].id,c.memories[0].id);assert.equal(h.summaries,1);}finally{h.host.close();}});
+test('failed memory save does not advance the successful cursor and can be retried later',async()=>{const h=await setup(({f})=>{f.faults.kv=f.faults.file=true;return new Response(JSON.stringify({choices:[{message:{content:'{"operations":[]}'}}]}));});try{await h.host.api.sendMessage('今天我搬家了');await until(()=>h.host.api.storageWarning?.includes('进度未推进'));assert.equal(h.host.api.conversations[0].memoryState.cursors.a.throughTimestamp,0);assert.equal(h.host.api.conversations[0].messages.length,2);h.f.faults.kv=h.f.faults.file=false;await h.f.load('src/services/agentsoulStorage.ts').flushConversationsNow();const stored=JSON.parse(JSON.parse(h.f.kv.get('@soulmate_conversations_commit_v1')).payload)[0];assert.equal(stored.memoryState.cursors.a.throughTimestamp,0);}finally{h.host.close();}});
+test('deleting memory while a summary is in flight prevents its late result from resurrecting it',async()=>{let finish;const h=await setup(()=>new Promise(resolve=>{finish=()=>resolve(new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({operations:[{action:'add',content:'用户喜欢喝无糖热咖啡',kind:'fact',factKey:'user.coffee'}]})}}]})));}));try{
+ const c=h.host.api.conversations[0];await h.host.api.updateConversation('a',{memories:[{id:'coffee',content:'用户喜欢喝无糖热咖啡',factKey:'user.coffee',kind:'fact',tags:[],weight:80,isFlashbulb:false,timestamp:1}]});
+ await h.host.api.sendMessage('关于咖啡');await until(()=>!!finish);await h.host.api.deleteMemory('a','coffee');finish();await pause();await pause();assert.equal(h.host.api.conversations[0].memories.length,0);assert.ok(h.host.api.conversations[0].memoryState.blocked.some(b=>b.factKey==='user.coffee'));
+ }finally{h.host.close();}});
+test('regeneration uses the same request path and keeps earlier text as a selectable version',async()=>{const h=await setup();try{await h.host.api.updateSettings('a',{memoryRecall:{enabled:false,interval:10}});await h.host.api.sendMessage('你好船长');await until(()=>!h.host.api.isStreaming);const answer=h.host.api.conversations[0].messages.find(m=>m.role==='assistant');await h.host.api.retryMessage(answer.id);await until(()=>!h.host.api.isStreaming);const latest=h.host.api.conversations[0].messages.find(m=>m.id===answer.id);assert.equal(h.chatCalls,2);assert.equal(latest.versions.length,1);assert.equal(latest.versions[0].content,answer.content);assert.equal(h.summaries,0);}finally{h.host.close();}});
+test('double send from an empty selection creates only one new conversation and one request',async()=>{const h=await setup();try{h.host.api.selectConversation('');const results=await Promise.allSettled([h.host.api.sendMessage('你好'),h.host.api.sendMessage('你好')]);assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(h.chatCalls,1);assert.equal(h.host.api.conversations.length,2);}finally{h.host.close();}});
